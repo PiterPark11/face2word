@@ -1,0 +1,7 @@
+{
+  "name": "Air Canvas & Magic Gestures",
+  "description": "A touchless drawing application controlled by hand gestures. Pinch to draw, open palm for menu, peace sign to dissolve art like snow.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
