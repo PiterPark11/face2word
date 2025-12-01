@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { MenuLayer } from './components/MenuLayer';
 import { Tool, Stroke, Point, HandGesture, HandLandmark, Results, Particle } from './types';
-import { distance, isFingerExtended, lerpPoint } from './utils/geometry';
+import { distance, lerpPoint, isOpenPalm, isVictorySign, isPointing } from './utils/geometry';
 
 // Type definition for window.MediaPipe
 declare global {
@@ -16,26 +16,29 @@ const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
-  // Logic State (Refs to avoid re-renders)
+  // Logic State
   const strokesRef = useRef<Stroke[]>([]);
   const currentStrokeRef = useRef<Stroke | null>(null);
   const particlesRef = useRef<Particle[]>([]);
   const canvasTransformRef = useRef({ x: 0, y: 0, scale: 1 });
   
-  // Input Smoothing
+  // Input Smoothing & Logic
   const lastPointRef = useRef<Point | null>(null);
+  const gestureBufferRef = useRef<HandGesture[]>([]); // Buffer for debouncing
+  const currentStableGestureRef = useRef<HandGesture>(HandGesture.NONE);
+  const menuHoldProgressRef = useRef<number>(0); // 0 to 1
+  
+  // Pinch Logic
+  const isPinchingRef = useRef<boolean>(false);
   const lastPinchDistRef = useRef<number | null>(null);
   const lastPinchCenterRef = useRef<Point | null>(null);
-  const palmHoldStartRef = useRef<number>(0);
-  const toggleCooldownRef = useRef<number>(0);
-  const lastGestureRef = useRef<HandGesture>(HandGesture.NONE);
 
-  // --- React State (Only for UI Overlay) ---
+  // --- React State (UI Overlay only) ---
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [currentTool, setCurrentTool] = useState<Tool>(Tool.PEN);
   const [currentColor, setCurrentColor] = useState('#ffffff');
   const [currentSize, setCurrentSize] = useState(6);
-  const [cursorPos, setCursorPos] = useState<Point | null>(null); // Only for Menu
+  const [cursorPos, setCursorPos] = useState<Point | null>(null); 
   const [debugMsg, setDebugMsg] = useState("Initializing Camera...");
 
   // --- Helpers ---
@@ -45,7 +48,7 @@ const App: React.FC = () => {
     const screenX = (1 - landmark.x) * window.innerWidth;
     const screenY = landmark.y * window.innerHeight;
 
-    // 2. Inverse Transform to get World Space (for drawing)
+    // 2. Inverse Transform to get World Space
     const t = canvasTransformRef.current;
     return {
       x: (screenX - t.x) / t.scale,
@@ -60,13 +63,32 @@ const App: React.FC = () => {
     };
   };
 
-  // --- Main Render & Logic Loop (Driven by MediaPipe) ---
+  /**
+   * Smooths the input point based on speed.
+   * Fast movement = Low smoothing (Responsive).
+   * Slow movement = High smoothing (Stable).
+   */
+  const smoothPoint = (current: Point, last: Point | null): Point => {
+    if (!last) return current;
+    const d = Math.sqrt(Math.pow(current.x - last.x, 2) + Math.pow(current.y - last.y, 2));
+    
+    // Dynamic alpha: If distance is large (fast), alpha is close to 1 (raw).
+    // If distance is small (slow), alpha is small (smooth).
+    // Thresholds: 2px (very slow) to 20px (fast)
+    const minAlpha = 0.15;
+    const maxAlpha = 0.8;
+    const alpha = Math.min(maxAlpha, Math.max(minAlpha, d / 20));
+    
+    return lerpPoint(last, current, alpha);
+  };
+
+  // --- Main Loop ---
   const onResults = useCallback((results: Results) => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
     
-    // Ensure canvas size matches window
-    if (canvas) {
+    if (canvas && video) {
+      // 1. Resize Canvas if needed
       if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
@@ -75,106 +97,148 @@ const App: React.FC = () => {
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
-      // 1. Draw Background (Video Feed)
+      // 2. Render Background (Video)
       ctx.save();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      // Important: Mirror the video feed
-      ctx.scale(-1, 1);
+      ctx.scale(-1, 1); // Mirror
       ctx.translate(-canvas.width, 0);
-      
-      // Use results.image if available, otherwise fallback to video element
+
+      // Robust video drawing
       if (results.image) {
         ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
-      } else if (video && video.readyState >= 2) {
-         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      } else if (video.readyState >= 2) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      } else {
+        // Fallback if video isn't ready
+        ctx.fillStyle = "#111";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
       ctx.restore();
 
-      // --- Logic Processing ---
-      let gesture = HandGesture.NONE;
+      // --- 3. Gesture Recognition Logic ---
+      let rawGesture = HandGesture.NONE;
       let primaryHand = null;
       let secondaryHand = null;
 
       if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-        // Assume first hand is primary for drawing
         primaryHand = results.multiHandLandmarks[0];
         if (results.multiHandLandmarks.length > 1) {
           secondaryHand = results.multiHandLandmarks[1];
         }
 
-        const indexTip = primaryHand[8];
-        const indexPip = primaryHand[6];
-        const thumbTip = primaryHand[4];
-        const middleTip = primaryHand[12];
-        const ringTip = primaryHand[16];
-        const pinkyTip = primaryHand[20];
+        const pinchDist = distance(primaryHand[8], primaryHand[4]);
 
-        // Finger States
-        const isIndexOpen = isFingerExtended(primaryHand, 8, 6);
-        const isMiddleOpen = isFingerExtended(primaryHand, 12, 10);
-        const isRingOpen = isFingerExtended(primaryHand, 16, 14);
-        const isPinkyOpen = isFingerExtended(primaryHand, 20, 18);
-        
-        // Calculate Pinch Distance (Index Tip <-> Thumb Tip)
-        // Convert to screen space for consistent pixel distance checks or use raw normalized
-        const pinchRawDist = distance(indexTip, thumbTip);
-        
-        // Gesture Detection Hierarchy
-
-        // 1. Two Finger Zoom (Highest Priority)
-        if (secondaryHand && isIndexOpen && isFingerExtended(secondaryHand, 8, 6)) {
-           gesture = HandGesture.TWO_FINGER_ZOOM;
-        }
-        // 2. Open Palm (Menu) - All fingers open
-        else if (isIndexOpen && isMiddleOpen && isRingOpen && isPinkyOpen && pinchRawDist > 0.1) {
-          gesture = HandGesture.OPEN_PALM;
-        }
-        // 3. Clear (Peace Sign) - Index & Middle open, Ring & Pinky closed
-        else if (isIndexOpen && isMiddleOpen && !isRingOpen && !isPinkyOpen) {
-          gesture = HandGesture.PEACE_CLEAR;
-        }
-        // 4. Pointing (Menu Selection) - Only index open
-        else if (isIndexOpen && !isMiddleOpen && !isRingOpen && !isPinkyOpen && pinchRawDist > 0.05) {
-          gesture = HandGesture.POINTING;
-        }
-        // 5. Drawing (Pinch) - Index and Thumb close
-        else if (pinchRawDist < 0.05) { // 0.05 is threshold for "touching"
-          gesture = HandGesture.PINCH_DRAW;
+        // Priority Chain
+        if (secondaryHand && isPointing(primaryHand) && isPointing(secondaryHand)) {
+          // Both hands pointing -> Zoom
+           rawGesture = HandGesture.TWO_FINGER_ZOOM;
+        } else if (isOpenPalm(primaryHand)) {
+          rawGesture = HandGesture.OPEN_PALM;
+        } else if (isVictorySign(primaryHand)) {
+          rawGesture = HandGesture.PEACE_CLEAR;
+        } else if (isPointing(primaryHand) && pinchDist > 0.1) {
+          // Explicit pointing for menu selection
+          rawGesture = HandGesture.POINTING;
+        } else {
+          // Hysteresis for Pinch (Drawing)
+          // Enter pinch at < 0.035
+          // Exit pinch at > 0.065
+          if (isPinchingRef.current) {
+            if (pinchDist < 0.065) rawGesture = HandGesture.PINCH_DRAW;
+            else rawGesture = HandGesture.NONE;
+          } else {
+            if (pinchDist < 0.035) rawGesture = HandGesture.PINCH_DRAW;
+            else rawGesture = HandGesture.NONE;
+          }
         }
       }
 
-      const now = Date.now();
+      // --- 4. Debouncing / Stabilization ---
+      // Add new gesture to buffer
+      const buffer = gestureBufferRef.current;
+      buffer.push(rawGesture);
+      if (buffer.length > 6) buffer.shift(); // Keep last 6 frames
 
-      // --- Gesture Handling ---
+      // Find majority gesture
+      const counts: Record<string, number> = {};
+      buffer.forEach(g => counts[g] = (counts[g] || 0) + 1);
+      
+      let majorityGesture = HandGesture.NONE;
+      let maxCount = 0;
+      for (const g in counts) {
+        if (counts[g] > maxCount) {
+          maxCount = counts[g];
+          majorityGesture = g as HandGesture;
+        }
+      }
 
-      // Menu Toggle
-      if (gesture === HandGesture.OPEN_PALM) {
-        if (palmHoldStartRef.current === 0) palmHoldStartRef.current = now;
-        if (now - palmHoldStartRef.current > 400 && now - toggleCooldownRef.current > 1000) {
-          setIsMenuOpen(prev => !prev);
-          toggleCooldownRef.current = now;
-          palmHoldStartRef.current = 0;
-          currentStrokeRef.current = null;
+      // Determine Stable Gesture (Require > 3/6 confidence)
+      const isStable = maxCount > 3;
+      // Special case: Pinch state needs immediate feedback to prevent laggy start
+      // So if rawGesture is Pinch, we might favor it slightly faster, 
+      // but for Mode Switching (Menu), we want stability.
+      
+      if (isStable) {
+        currentStableGestureRef.current = majorityGesture;
+      }
+
+      // Is Pinching State Update
+      isPinchingRef.current = (currentStableGestureRef.current === HandGesture.PINCH_DRAW);
+
+      const activeGesture = currentStableGestureRef.current;
+
+      // --- 5. Application Logic ---
+
+      // GLOBAL: Menu Toggle Logic
+      // Requirement: "Detect whole palm pops up UI... detect whole palm to exit"
+      if (activeGesture === HandGesture.OPEN_PALM) {
+        menuHoldProgressRef.current = Math.min(menuHoldProgressRef.current + 0.05, 1);
+        
+        // Draw Progress Circle around hand
+        if (primaryHand) {
+           const center = toScreenPoint(primaryHand[9]); // Middle finger MCP is roughly center
+           ctx.beginPath();
+           ctx.arc(center.x, center.y, 40, 0, Math.PI * 2 * menuHoldProgressRef.current);
+           ctx.strokeStyle = isMenuOpen ? '#ef4444' : '#22c55e'; // Red to close, Green to open
+           ctx.lineWidth = 5;
+           ctx.stroke();
+        }
+
+        if (menuHoldProgressRef.current >= 1) {
+           // Toggle
+           setIsMenuOpen(prev => !prev);
+           menuHoldProgressRef.current = 0; // Reset
+           gestureBufferRef.current = []; // Clear buffer to prevent rapid toggle
         }
       } else {
-        palmHoldStartRef.current = 0;
+        menuHoldProgressRef.current = Math.max(menuHoldProgressRef.current - 0.05, 0);
       }
 
-      // If Menu is Open, only handle pointing
+      // MODE SPECIFIC
       if (isMenuOpen) {
-        if (gesture === HandGesture.POINTING && primaryHand) {
+        // --- MENU MODE ---
+        // Only allow Pointing
+        if (activeGesture === HandGesture.POINTING && primaryHand) {
           const rawPoint = { x: 1 - primaryHand[8].x, y: primaryHand[8].y };
-          setCursorPos(rawPoint);
+          // Smooth the cursor for menu too
+          setCursorPos(prev => {
+             const px = prev ? prev.x : rawPoint.x;
+             const py = prev ? prev.y : rawPoint.y;
+             return {
+               x: px + (rawPoint.x - px) * 0.3, 
+               y: py + (rawPoint.y - py) * 0.3
+             };
+          });
         } else {
           setCursorPos(null);
         }
-        // Skip drawing/zoom logic
+        
       } else {
-        // Menu Closed - Interactions
-        setCursorPos(null);
+        // --- CANVAS MODE ---
+        setCursorPos(null); // Hide system cursor
 
-        // Zoom Logic
-        if (gesture === HandGesture.TWO_FINGER_ZOOM && primaryHand && secondaryHand) {
+        // 1. ZOOMING
+        if (activeGesture === HandGesture.TWO_FINGER_ZOOM && primaryHand && secondaryHand) {
           const p1 = toScreenPoint(primaryHand[8]);
           const p2 = toScreenPoint(secondaryHand[8]);
           const currentDist = distance(p1, p2);
@@ -184,11 +248,7 @@ const App: React.FC = () => {
           if (lastPinchDistRef.current !== null && lastPinchCenterRef.current !== null) {
              const deltaScale = currentDist / lastPinchDistRef.current;
              const prev = canvasTransformRef.current;
-             
-             // Smooth Zoom
              const newScale = Math.min(Math.max(prev.scale * deltaScale, 0.5), 5);
-             
-             // Zoom towards center: Translate correction
              const newX = centerX - (centerX - prev.x) * (newScale / prev.scale);
              const newY = centerY - (centerY - prev.y) * (newScale / prev.scale);
 
@@ -196,98 +256,82 @@ const App: React.FC = () => {
           }
           lastPinchDistRef.current = currentDist;
           lastPinchCenterRef.current = { x: centerX, y: centerY };
-          currentStrokeRef.current = null;
-          lastPointRef.current = null;
+          currentStrokeRef.current = null; // Cancel drawing if zooming
         } else {
           lastPinchDistRef.current = null;
         }
 
-        // Clear (Peace) Logic
-        if (gesture === HandGesture.PEACE_CLEAR) {
-           if (strokesRef.current.length > 0) {
-             // Explode strokes into particles
-             strokesRef.current.forEach(s => {
-               for (let i = 0; i < s.points.length; i += 3) {
-                 const p = s.points[i];
-                 particlesRef.current.push({
-                   x: p.x,
-                   y: p.y,
-                   vx: (Math.random() - 0.5) * 6,
-                   vy: (Math.random() * -2) - 2, // Upward burst
-                   color: s.color,
-                   size: Math.random() * s.size + 2,
-                   life: 1.0 + Math.random() * 0.5
-                 });
-               }
-             });
-             strokesRef.current = [];
-           }
-           currentStrokeRef.current = null;
-           lastPointRef.current = null;
+        // 2. CLEARING (Snow)
+        if (activeGesture === HandGesture.PEACE_CLEAR && strokesRef.current.length > 0) {
+           // Create explosion effect
+           strokesRef.current.forEach(s => {
+             // Sample points to reduce particle count
+             for (let i = 0; i < s.points.length; i += 2) {
+               const p = s.points[i];
+               particlesRef.current.push({
+                 x: p.x,
+                 y: p.y,
+                 vx: (Math.random() - 0.5) * 4,
+                 vy: (Math.random() * -3) - 1,
+                 color: s.color,
+                 size: Math.random() * s.size * 0.8,
+                 life: 1.0 + Math.random()
+               });
+             }
+           });
+           strokesRef.current = []; // Clear ink
         }
 
-        // Drawing Logic
-        if (gesture === HandGesture.PINCH_DRAW && primaryHand) {
-          const rawTarget = toCanvasPoint(primaryHand[8]);
+        // 3. DRAWING
+        if (activeGesture === HandGesture.PINCH_DRAW && primaryHand) {
+          const rawTarget = toCanvasPoint(primaryHand[8]); // Index tip is the pen
           
-          // Smoothing: Exponential Moving Average
-          const smoothFactor = 0.4;
-          const point = lastPointRef.current 
-            ? lerpPoint(lastPointRef.current, rawTarget, smoothFactor) 
-            : rawTarget;
-          
+          // Apply Dynamic Smoothing
+          const point = smoothPoint(rawTarget, lastPointRef.current);
           lastPointRef.current = point;
 
           if (!currentStrokeRef.current) {
-            // Start new stroke
-            currentStrokeRef.current = {
-              points: [point],
-              color: currentTool === Tool.ERASER ? '#000000' : currentColor,
-              size: currentSize,
-              isEraser: currentTool === Tool.ERASER
-            };
+             // Start Stroke
+             currentStrokeRef.current = {
+               points: [point],
+               color: currentTool === Tool.ERASER ? '#000000' : currentColor,
+               size: currentSize,
+               isEraser: currentTool === Tool.ERASER
+             };
           } else {
-            // Append to existing
-            const pts = currentStrokeRef.current.points;
-            const lastP = pts[pts.length - 1];
-            if (distance(lastP, point) > 1) { // Min distance to reduce point density
+             // Continue Stroke
+             const pts = currentStrokeRef.current.points;
+             const lastP = pts[pts.length - 1];
+             if (distance(lastP, point) > 2) { // Minimum distance
                pts.push(point);
-            }
+             }
           }
         } else {
-           // Lift pen
-           if (currentStrokeRef.current) {
-             strokesRef.current.push(currentStrokeRef.current);
-             currentStrokeRef.current = null;
-           }
-           lastPointRef.current = null;
+          // Stop Drawing
+          if (currentStrokeRef.current) {
+            strokesRef.current.push(currentStrokeRef.current);
+            currentStrokeRef.current = null;
+          }
+          lastPointRef.current = null; // Reset smoothing anchor
         }
       }
 
-      // --- Drawing the World (Ink & Particles) ---
-      
+      // --- 6. Render Canvas Elements ---
       const t = canvasTransformRef.current;
       ctx.save();
-      // Apply Pan/Zoom Transform
       ctx.translate(t.x, t.y);
       ctx.scale(t.scale, t.scale);
-      
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
 
+      // Draw Ink
       const drawStroke = (s: Stroke) => {
         if (s.points.length < 2) return;
         ctx.beginPath();
         ctx.lineWidth = s.size;
         ctx.strokeStyle = s.color;
+        ctx.globalCompositeOperation = s.isEraser ? 'destination-out' : 'source-over';
         
-        if (s.isEraser) {
-          ctx.globalCompositeOperation = 'destination-out';
-        } else {
-          ctx.globalCompositeOperation = 'source-over';
-        }
-
-        // Quadratic Bezier smoothing
         ctx.moveTo(s.points[0].x, s.points[0].y);
         for (let i = 1; i < s.points.length - 1; i++) {
           const p1 = s.points[i];
@@ -296,43 +340,38 @@ const App: React.FC = () => {
           ctx.quadraticCurveTo(p1.x, p1.y, mid.x, mid.y);
         }
         ctx.lineTo(s.points[s.points.length - 1].x, s.points[s.points.length - 1].y);
-        
         ctx.stroke();
       };
 
-      // Draw History
       strokesRef.current.forEach(drawStroke);
-      // Draw Active
       if (currentStrokeRef.current) drawStroke(currentStrokeRef.current);
 
-      // Draw Particles (Snow)
+      // Draw Particles
       if (particlesRef.current.length > 0) {
         ctx.globalCompositeOperation = 'source-over';
         particlesRef.current.forEach(p => {
           ctx.beginPath();
           ctx.fillStyle = p.color;
-          ctx.globalAlpha = p.life;
+          ctx.globalAlpha = Math.max(0, p.life);
           ctx.arc(p.x, p.y, p.size / 2, 0, Math.PI * 2);
           ctx.fill();
           
-          // Update Logic inside render loop
           p.x += p.vx;
           p.y += p.vy;
-          p.vy += 0.15; // Gravity
-          p.vx *= 0.99; // Drag
-          p.life -= 0.015; // Fade
-          p.size *= 0.99; // Shrink
+          p.vy += 0.2; // Gravity
+          p.vx *= 0.95; // Drag
+          p.life -= 0.02; 
+          p.size *= 0.98;
         });
         ctx.globalAlpha = 1.0;
-        // Clean up dead particles
         particlesRef.current = particlesRef.current.filter(p => p.life > 0);
       }
 
       ctx.restore();
-      
-      // Visual Debug for Gesture
+
+      // Debug Text
       if (!isMenuOpen) {
-        setDebugMsg(`Mode: ${isMenuOpen ? "MENU" : gesture.replace('_', ' ')}`);
+        setDebugMsg(`Gesture: ${activeGesture.replace('_', ' ')}`);
       }
     }
   }, [isMenuOpen, currentColor, currentSize, currentTool]);
@@ -349,16 +388,14 @@ const App: React.FC = () => {
     const initMediaPipe = async () => {
       try {
         hands = new window.Hands({
-          locateFile: (file: string) => {
-            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
-          },
+          locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
         });
 
         hands.setOptions({
           maxNumHands: 2,
           modelComplexity: 1,
-          minDetectionConfidence: 0.6, // Higher confidence to reduce jitter
-          minTrackingConfidence: 0.6,
+          minDetectionConfidence: 0.7, // Higher confidence to reduce ghosting
+          minTrackingConfidence: 0.7,
         });
 
         hands.onResults(onResults);
@@ -379,10 +416,10 @@ const App: React.FC = () => {
         });
 
         await camera.start();
-        setDebugMsg("Camera Active. Show hand.");
+        setDebugMsg("Camera Active");
       } catch (err) {
         console.error(err);
-        setDebugMsg("Camera Error. Please allow permissions.");
+        setDebugMsg("Camera access needed.");
       }
     };
 
@@ -406,51 +443,34 @@ const App: React.FC = () => {
 
   return (
     <div className="relative w-full h-full bg-gray-900 overflow-hidden">
-      {/* Hidden Source Video (Logic only) */}
-      <video
-        ref={videoRef}
-        className="hidden"
-        playsInline
-        muted
-      />
-      
-      {/* Main Rendering Canvas (Video + Ink + Particles) */}
-      <canvas
-        ref={canvasRef}
-        className="absolute top-0 left-0 w-full h-full block"
-      />
+      <video ref={videoRef} className="hidden" playsInline muted />
+      <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full block" />
 
-      {/* React UI Layer */}
       <MenuLayer
         isOpen={isMenuOpen}
         currentTool={currentTool}
         currentColor={currentColor}
         currentSize={currentSize}
-        onSelectTool={(t) => setCurrentTool(t)}
-        onSelectColor={(c) => setCurrentColor(c)}
-        onSelectSize={(s) => setCurrentSize(s)}
+        onSelectTool={setCurrentTool}
+        onSelectColor={setCurrentColor}
+        onSelectSize={setCurrentSize}
         cursorPos={cursorPos}
       />
 
-      {/* Instructions / Status */}
-      <div className="absolute top-4 left-4 p-4 rounded-xl bg-black/40 backdrop-blur-sm text-white/70 text-sm pointer-events-none select-none z-40 border border-white/10">
-        <p className="font-bold text-white mb-1">{debugMsg}</p>
-        <div className="space-y-1 text-xs">
+      <div className="absolute top-4 left-4 p-4 rounded-xl bg-black/50 backdrop-blur-sm text-white/80 pointer-events-none select-none z-40 border border-white/10 shadow-xl">
+        <p className="font-bold text-white mb-2 text-lg">{debugMsg}</p>
+        <div className="space-y-2 text-xs opacity-90">
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-yellow-400"></span>
-            <span><b>Open Palm</b>: Toggle Menu</span>
+            <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+            <span><b>Hold Open Palm</b>: Toggle Menu</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-blue-400"></span>
+            <span className="w-2 h-2 rounded-full bg-blue-500"></span>
             <span><b>Pinch (Index+Thumb)</b>: Draw</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-red-400"></span>
-            <span><b>Peace Sign</b>: Dissolve Ink</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-purple-400"></span>
-            <span><b>Two Hands</b>: Zoom & Pan</span>
+            <span className="w-2 h-2 rounded-full bg-red-500"></span>
+            <span><b>Peace Sign (✌️)</b>: Dissolve Art</span>
           </div>
         </div>
       </div>
